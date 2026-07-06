@@ -1,0 +1,7 @@
+*.pdf
+.vscode/
+.idea/
+.agents/
+cmake-build-debug/
+cmake-build-release-remote-host/
+CMakeLists.txt
