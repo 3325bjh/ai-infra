@@ -1,0 +1,9 @@
+[submodule "third-party/cutlass"]
+	path = third-party/cutlass
+	url = https://github.com/NVIDIA/cutlass.git
+[submodule "ffpa-attn"]
+	path = ffpa-attn
+	url = https://github.com/xlite-dev/ffpa-attn.git
+[submodule "HGEMM"]
+	path = HGEMM
+	url = https://github.com/xlite-dev/HGEMM.git
