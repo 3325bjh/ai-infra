@@ -111,7 +111,7 @@ def matmul(a,b):
 
 
 
-def test_matmul_kernel(size:tuple,atol=1e-2,rtol=1e-1,device=DEVICE):
+def matmul_kernel_test(size:tuple,atol=1e-2,rtol=1e-1,device=DEVICE):
     torch.manual_seed(0)
     assert type(size)==tuple and len(size)==2
     a=torch.randn(size,device=DEVICE,dtype=torch.float16)
@@ -122,6 +122,6 @@ def test_matmul_kernel(size:tuple,atol=1e-2,rtol=1e-1,device=DEVICE):
     print("PASSED")
 
 if __name__ == '__main__':
-    test_matmul_kernel(size=(512,512))
+    matmul_kernel_test(size=(512,512))
     # print("Running benchmark...")
-    benchmark.run(show_plots=True, print_data=False, save_path='.')
+    benchmark.run(show_plots=True, print_data=False, save_path='./')

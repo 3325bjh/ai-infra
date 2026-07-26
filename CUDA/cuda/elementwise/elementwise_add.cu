@@ -30,6 +30,17 @@ void __global__ add5(float *x, float *y, float *z) {
     z[n]=x[n]+y[n];
 }
 
+void __global__ add6(float *x, float *y, float *z) {
+    int n=threadIdx.x+blockIdx.x*blockDim.x;
+    float a=x[n];
+    float b=y[n];
+    float c=0;
+    for (int i=0;i<1000;i++) {
+        c+=(a+b);
+    }
+    z[n]=c;
+}
+
 
 int main()
 {
@@ -56,13 +67,14 @@ int main()
 
     cudaMemcpy(d_a, h_a, nbytes, cudaMemcpyHostToDevice);
     cudaMemcpy(d_b, h_b, nbytes, cudaMemcpyHostToDevice);
-    dim3 grid(n/256);
-    dim3 block(64);
+    dim3 grid(n/1024);
+    dim3 block(256);
     add1<<<grid,block>>>(d_a, d_b, d_res);
-    add2<<<grid,block>>>(d_a, d_b, d_res);
-    add3<<<grid,block>>>(d_a, d_b, d_res);
-    add4<<<grid,block>>>(d_a, d_b, d_res);
-    add5<<<grid,block>>>(d_a, d_b, d_res);
+    // add2<<<grid,block>>>(d_a, d_b, d_res);
+    // add3<<<grid,block>>>(d_a, d_b, d_res);
+    // add4<<<grid,block>>>(d_a, d_b, d_res);
+    // add5<<<grid,block>>>(d_a, d_b, d_res);
+    add6<<<grid,block>>>(d_a, d_b, d_res);
     cudaGetLastError();
     cudaMemcpy(h_res, d_res, nbytes, cudaMemcpyDeviceToHost);
 

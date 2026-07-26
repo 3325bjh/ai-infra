@@ -47,6 +47,99 @@ __global__ void transpose_4x4(float * a, float * b,int M,int N) {
     }
 }
 
+#define FLOAT2(val) reinterpret_cast<float2*>(&val)[0]
+__global__ void transpose_2x2(float * a, float * b,int M,int N) {
+    float src_transpose[2][2];
+    float dst_transpose[2][2];
+    float *a_start=a+blockIdx.y*blockDim.y*2*N+blockIdx.x*blockDim.x*2;
+    for (int i=0;i<2;i++) {
+        FLOAT2(src_transpose[i])=FLOAT2(a_start[(threadIdx.y*2+i)*N+threadIdx.x*2]);
+    }
+    FLOAT2(dst_transpose[0])=make_float2(src_transpose[0][0],src_transpose[1][0]);
+    FLOAT2(dst_transpose[1])=make_float2(src_transpose[0][1],src_transpose[1][1]);
+    float* b_start=b+blockIdx.x*blockDim.x*2*M+blockIdx.y*blockDim.y*2;
+    for (int i=0;i<2;i++) {
+        FLOAT2(b_start[(threadIdx.x*2+i)*M+threadIdx.y*2])=FLOAT2(dst_transpose[i][0]);
+    }
+}
+
+__global__ void transpose_2(float * a, float * b,int M,int N) {
+    float src_transpose[2];
+    float dst_transpose[2];
+    float *a_start=a+blockIdx.y*blockDim.y*N*2+blockIdx.x*blockDim.x;
+    src_transpose[0]=a_start[(threadIdx.y*2)*N+threadIdx.x];
+    src_transpose[1]=a_start[(threadIdx.y*2+1)*N+threadIdx.x];
+    FLOAT2(dst_transpose[0])=make_float2(src_transpose[0],src_transpose[1]);
+    float* b_start=b+blockIdx.x*blockDim.x*M+blockIdx.y*blockDim.y*2;
+    FLOAT2(b_start[(threadIdx.x)*M+threadIdx.y*2])=FLOAT2(dst_transpose[0]);
+}
+template <int BLOCK_SZ>
+__global__ void transpose_shared_memory(float * a, float * b,int M,int N) {
+   const int tx=threadIdx.x;
+    const int ty=threadIdx.y;
+    int x=blockDim.x*blockIdx.x+tx;
+    int y=blockIdx.y*blockDim.y+ty;
+    float *a_start=a+N*blockIdx.y*BLOCK_SZ+blockIdx.x*BLOCK_SZ;
+    __shared__ float sdata[BLOCK_SZ][BLOCK_SZ];
+    if (y<M&&x<N) {
+        sdata[tx][ty]=a_start[ty*N+tx];
+    }
+    __syncthreads();
+    x=blockDim.y*blockIdx.y+tx;
+    y=blockDim.x*blockIdx.x+ty;
+    float *b_start=b+M*blockIdx.x*BLOCK_SZ+blockIdx.y*BLOCK_SZ;
+    if (y<N&&x<M) {
+        b_start[ty*M+tx]=sdata[ty][tx];
+    }
+}
+
+template <int BLOCK_SZ>
+__global__ void transpose_shared_memory_pad(float * a, float * b,int M,int N) {
+    const int tx=threadIdx.x;
+    const int ty=threadIdx.y;
+    int x=blockDim.x*blockIdx.x+tx;
+    int y=blockIdx.y*blockDim.y+ty;
+    float *a_start=a+N*blockIdx.y*BLOCK_SZ+blockIdx.x*BLOCK_SZ;
+    __shared__ float sdata[BLOCK_SZ][BLOCK_SZ+1];
+    if (y<M&&x<N) {
+        sdata[tx][ty]=a_start[ty*N+tx];
+    }
+    __syncthreads();
+    x=blockDim.y*blockIdx.y+tx;
+    y=blockDim.x*blockIdx.x+ty;
+    float *b_start=b+M*blockIdx.x*BLOCK_SZ+blockIdx.y*BLOCK_SZ;
+    if (y<N&&x<M) {
+        b_start[ty*M+tx]=sdata[ty][tx];
+    }
+}
+
+template <int BLOCK_SZ,int NUM_PER_THREAD>
+__global__ void transpose_shared_memory_pad_mat(float * a, float * b,int M,int N) {
+    const int STEP=BLOCK_SZ/NUM_PER_THREAD;
+    const int tx=threadIdx.x;
+    const int ty=threadIdx.y;
+    const int bx=blockIdx.x;
+    const int by=blockIdx.y;
+    int x=blockDim.x*blockIdx.x+tx;
+    int y=blockIdx.y*blockDim.y+ty;
+    float *a_start=a+N*by*BLOCK_SZ+bx*BLOCK_SZ;
+    __shared__ float sdata[BLOCK_SZ][BLOCK_SZ+1];
+    for (int i=0;i<NUM_PER_THREAD;i++) {
+        if (x+i*STEP<N&&y<M) {
+            sdata[tx+i*STEP][ty]=a_start[ty*N+tx+i*STEP];
+        }
+    }
+    x=blockDim.y*blockIdx.y+tx;
+    y=blockDim.x*blockIdx.x+ty;
+    __syncthreads();
+    float *b_start=b+M*bx*BLOCK_SZ+by*BLOCK_SZ;
+    for (int i=0;i<NUM_PER_THREAD;i++) {
+        if (x+i*STEP<M&&y<N) {
+            b_start[ty*M+tx+i*STEP]=sdata[ty][tx+i*STEP];
+        }
+    }
+}
+
 void cpu_transpose(float *a,float *b,int M,int N) {
     for (int i=0;i<M;i++) {
         for (int j=0;j<N;j++) {
@@ -82,41 +175,77 @@ int main() {
     }
     cpu_transpose(a,ground_truth,M,N);
     cudaMemcpy(a_device,a,n_bytes,cudaMemcpyHostToDevice);
+    // for (int i=0;i<5;i++) {
+    //     Perf perf("transpose_32_8");
+    //     dim3 block(32,8);
+    //     dim3 grid(N/32,M/8);
+    //     transpose<<<grid,block>>>(a_device,b_device,M,N);
+    //     cudaDeviceSynchronize();
+    // }
+    // for (int i=0;i<5;i++) {
+    //     Perf perf("transpose_16_16");
+    //     dim3 block(16,16);
+    //     dim3 grid(N/16,M/16);
+    //     transpose<<<grid,block>>>(a_device,b_device,M,N);
+    //     cudaDeviceSynchronize();
+    // }
+    // for (int i=0;i<5;i++) {
+    //     Perf perf("transpose_8_32");
+    //     dim3 block(8,32);
+    //     dim3 grid(N/8,M/32);
+    //     transpose<<<grid,block>>>(a_device,b_device,M,N);
+    //     cudaDeviceSynchronize();
+    // }
+    // for (int i=0;i<5;i++) {
+    //     Perf perf("transpose_4x4");
+    //     dim3 block(32,8);
+    //     dim3 grid(N/128,M/32);
+    //     transpose_4x4<<<grid,block>>>(a_device,b_device,M,N);
+    //     cudaDeviceSynchronize();
+    // }
+    // for (int i=0;i<5;i++) {
+    //     Perf perf("transpose_4x4");
+    //     dim3 block(16,16);
+    //     dim3 grid(N/64,M/64);
+    //     transpose_4x4<<<grid,block>>>(a_device,b_device,M,N);
+    //     cudaDeviceSynchronize();
+    // }
+    // for (int i=0;i<5;i++) {
+    //     Perf perf("transpose_4x4");
+    //     dim3 block(8,32);
+    //     dim3 grid(N/64,M/128);
+    //     transpose_4x4<<<grid,block>>>(a_device,b_device,M,N);
+    //     cudaDeviceSynchronize();
+    // }
+    // for (int i=0;i<5;i++) {
+    //     Perf perf("transpose_2x2");
+    //     dim3 block(8,32);
+    //     dim3 grid(N/16,M/64);
+    //     transpose_2x2<<<grid,block>>>(a_device,b_device,M,N);
+    //     cudaDeviceSynchronize();
+    // }
+    // for (int i=0;i<5;i++) {
+    //     Perf perf("transpose_2");
+    //     dim3 block(8,32);
+    //     dim3 grid(N/8,M/64);
+    //     transpose_2<<<grid,block>>>(a_device,b_device,M,N);
+    //     cudaDeviceSynchronize();
+    // }
+    // for (int i=0;i<5;i++) {
+    //     Perf perf("transpose_shared_memory");
+    //     dim3 block(16,16);
+    //     dim3 grid(N+15/16,M+15/16);
+    //     transpose_shared_memory<16><<<grid,block>>>(a_device,b_device,M,N);
+    //     cudaDeviceSynchronize();
+    // }
     for (int i=0;i<5;i++) {
-        Perf perf("transpose_32_8");
-        dim3 block(32,8);
-        dim3 grid(N/32,M/8);
-        transpose<<<grid,block>>>(a_device,b_device,M,N);
+        Perf perf("transpose_shared_memory_pad_mat");
+        dim3 block(4,16);
+        dim3 grid((N+15)/16,(M+15)/16);
+        transpose_shared_memory_pad_mat<16,4><<<grid,block>>>(a_device,b_device,M,N);
         cudaDeviceSynchronize();
     }
-    for (int i=0;i<5;i++) {
-        Perf perf("transpose_16_16");
-        dim3 block(16,16);
-        dim3 grid(N/16,M/16);
-        transpose<<<grid,block>>>(a_device,b_device,M,N);
-        cudaDeviceSynchronize();
-    }
-    for (int i=0;i<5;i++) {
-        Perf perf("transpose_8_32");
-        dim3 block(8,32);
-        dim3 grid(N/8,M/32);
-        transpose<<<grid,block>>>(a_device,b_device,M,N);
-        cudaDeviceSynchronize();
-    }
-    for (int i=0;i<5;i++) {
-        Perf perf("transpose_4x4");
-        dim3 block(32,8);
-        dim3 grid(N/128,M/32);
-        transpose_4x4<<<grid,block>>>(a_device,b_device,M,N);
-        cudaDeviceSynchronize();
-    }
-    for (int i=0;i<5;i++) {
-        Perf perf("transpose_4x4");
-        dim3 block(16,16);
-        dim3 grid(N/64,M/64);
-        transpose_4x4<<<grid,block>>>(a_device,b_device,M,N);
-        cudaDeviceSynchronize();
-    }
+
     cudaMemcpy(b,b_device,n_bytes,cudaMemcpyDeviceToHost);
     if (check(b,ground_truth,M,N)) {
         printf("pass\n");
