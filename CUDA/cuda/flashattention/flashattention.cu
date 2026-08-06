@@ -20,9 +20,14 @@ void init(float *q,float *k,float *v,int B,int H,int S,int Hidden) {
 
 }
 
-void safe_softmax(float *qk, int seq_len) {
+void safe_softmax(float *qk, int seq_len, bool causal) {
     for (int s = 0; s < seq_len; s++) {
         float max_val = -FLT_MAX;
+        if (causal) {
+            for (int j = s + 1; j < seq_len; ++j) {
+                qk[s * seq_len + j] = -FLT_MAX;
+            }
+        }
 
         for (int j = 0; j < seq_len; j++) {
             max_val = fmaxf(max_val, qk[s * seq_len + j]);
@@ -68,7 +73,7 @@ void gemm(const float *a, const float *b,
 }
 
 void attention(const float *q, const float *k, const float *v,
-               int S, int Hidden, float *output) {
+               int S, int Hidden, float *output,bool causal) {
     float *qk = (float *)malloc((size_t)S * S * sizeof(*qk));
     if (!qk) return;  // 实际项目建议返回错误码
 
@@ -76,7 +81,7 @@ void attention(const float *q, const float *k, const float *v,
 
     // qk = Q * K^T / sqrt(Hidden)
     qk_gemm(q, k, S, S, Hidden, qk, scale);
-    safe_softmax(qk, S);
+    safe_softmax(qk, S,causal);
 
     // output = softmax(qk) * V
     gemm(qk, v, S, Hidden, S, output);
@@ -85,7 +90,7 @@ void attention(const float *q, const float *k, const float *v,
 }
 
 void cpu_attention(const float *q, const float *k, const float *v,
-                   int B, int H, int S, int Hidden, float *output) {
+                   int B, int H, int S, int Hidden, float *output,bool causal) {
     size_t head_stride = (size_t)S * Hidden;
 
     for (int b = 0; b < B; b++) {
@@ -93,7 +98,7 @@ void cpu_attention(const float *q, const float *k, const float *v,
             size_t offset = ((size_t)b * H + h) * head_stride;
 
             attention(q + offset, k + offset, v + offset,
-                      S, Hidden, output + offset);
+                      S, Hidden, output + offset,causal);
         }
     }
 }
@@ -177,6 +182,74 @@ __global__ void flash_attention_kernel(float *q,float *k,float *v,int seq_len,in
     }
 }
 
+template<int BR,int BC,int D>
+__global__ void flash_attention2_kernel(float *q,float *k,float *v,int headNum,int seq_len,int hidden_dim,float *output, bool causal) {
+    float *q_start=q+(blockIdx.z*headNum+blockIdx.y)*seq_len*hidden_dim+blockIdx.x*BR*hidden_dim;
+    float *k_start=k+(blockIdx.z*headNum+blockIdx.y)*seq_len*hidden_dim;
+    float *v_start=v+(blockIdx.z*headNum+blockIdx.y)*seq_len*hidden_dim;
+    float *output_start=output+(blockIdx.z*headNum+blockIdx.y)*seq_len*hidden_dim+blockIdx.x*BR*hidden_dim;
+    extern __shared__ float shared_mem[];
+    float* shared_q=shared_mem;
+    float* shared_k=shared_q+BR*hidden_dim;
+    float* shared_v=shared_k+BC*hidden_dim;
+    float o[D]={};
+    float S[BC];
+    float premax=-FLT_MAX;
+    float l=0.0f;
+    float dk = rsqrtf((float)hidden_dim);
+    for (int i=0;i<hidden_dim;i++) {
+        shared_q[threadIdx.x*hidden_dim+i]=q_start[threadIdx.x*hidden_dim+i];
+    }
+    __syncthreads();
+    for (int j=0;j<seq_len;j+=BC) {
+        for (int i=threadIdx.x;i<BC;i+=BR) {
+            for (int h=0;h<hidden_dim;h++) {
+                shared_k[i*hidden_dim+h]=k_start[(j+i)*hidden_dim+h];
+                shared_v[i*hidden_dim+h]=v_start[(j+i)*hidden_dim+h];
+            }
+        }
+        __syncthreads();
+        float max=-FLT_MAX;
+        const int q_pos = blockIdx.x * BR + threadIdx.x;
+        for (int col = 0; col < BC; ++col) {
+            const int k_pos = j + col;
+
+            if (k_pos >= seq_len || (causal && k_pos > q_pos)) {
+                S[col] = -FLT_MAX;
+            } else {
+                float score = 0.0f;
+                for (int d = 0; d < hidden_dim; ++d) {
+                    score += shared_q[threadIdx.x * hidden_dim + d] *
+                             shared_k[col * hidden_dim + d];
+                }
+                S[col] = score * dk;
+            }
+
+            max = fmaxf(max, S[col]);
+        }
+        float curmax=fmax(max,premax);
+        l=l*expf(premax-curmax);
+
+        for (int col=0;col<BC;col++) {
+            S[col]=expf(S[col]-curmax);
+            l+=S[col];
+        }
+        for (int h=0;h<hidden_dim;h++) {
+            o[h]=o[h]*expf(premax-curmax);
+            for (int bc=0;bc<BC;bc++) {
+                o[h]+=S[bc]*shared_v[bc*hidden_dim+h];
+            }
+        }
+        premax=curmax;
+        __syncthreads();
+    }
+    for (int h=0;h<hidden_dim;h++) {
+        o[h]/=l;
+        output_start[threadIdx.x*hidden_dim+h]=o[h];
+    }
+}
+
+
 // Compares the GPU result against cpu_attention's output.  The tolerance rule
 // is: abs(gpu - cpu) <= atol + rtol * abs(cpu).
 bool validate_attention_output(const float *cpu_output, const float *d_output,
@@ -251,8 +324,9 @@ int main() {
     const int batch_size=4;
     const int head_num=5;
     const int seq_len=1024;
-    const int hidden_dim=16;
+    constexpr int hidden_dim=16;
     float* q,*k,*v,*output;
+    constexpr bool causal = true;
     float* d_q,*d_k,*d_v,*d_output,*d_m,*d_sum;
     size_t size=batch_size*head_num*seq_len*hidden_dim*sizeof(float);
     size_t size_m=batch_size*head_num*seq_len*sizeof(float);
@@ -262,7 +336,7 @@ int main() {
     v=(float*)malloc(size);
     output=(float*)malloc(size);
     init(q,k,v,batch_size,head_num,seq_len,hidden_dim);
-    cpu_attention(q,k,v,batch_size,head_num,seq_len,hidden_dim,output);
+    cpu_attention(q,k,v,batch_size,head_num,seq_len,hidden_dim,output,causal);
     cudaMalloc((void **)&d_q,size);
     cudaMalloc((void **)&d_k,size);
     cudaMalloc((void **)&d_v,size);
@@ -274,11 +348,16 @@ int main() {
     cudaMemcpy(d_v,v,size,cudaMemcpyHostToDevice);
     constexpr int br=32;
     constexpr int bc=64;
+    // size_t shared_bytes =
+    // (br + 2 * bc) * hidden_dim * sizeof(float);
+    // dim3 grid(head_num,batch_size);
+    // dim3 block(br);
+    // flash_attention_kernel<br,bc><<<grid,block,shared_bytes>>>(d_q,d_k,d_v,seq_len,hidden_dim,d_output,d_m,d_sum);
     size_t shared_bytes =
     (br + 2 * bc) * hidden_dim * sizeof(float);
-    dim3 grid(head_num,batch_size);
+    dim3 grid(seq_len/br,head_num,batch_size);
     dim3 block(br);
-    flash_attention_kernel<br,bc><<<grid,block,shared_bytes>>>(d_q,d_k,d_v,seq_len,hidden_dim,d_output,d_m,d_sum);
+    flash_attention2_kernel<br,bc,hidden_dim><<<grid,block,shared_bytes>>>(d_q,d_k,d_v,head_num,seq_len,hidden_dim,d_output,causal);
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         fprintf(stderr, "kernel launch failed: %s\n",
