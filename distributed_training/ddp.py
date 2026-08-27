@@ -12,6 +12,7 @@
 
 import argparse
 import os
+from contextlib import nullcontext
 from math import ceil
 from random import Random
 
@@ -23,6 +24,13 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.nn.parallel import DistributedDataParallel
 from torchvision import datasets, transforms
+
+
+def average_allreduce_hook(state, bucket):
+    """A DDP communication hook with the same averaging semantics as DDP."""
+    del state
+    future = dist.all_reduce(bucket.buffer(), op=dist.ReduceOp.SUM, async_op=True).get_future()
+    return future.then(lambda completed: completed.value()[0] / dist.get_world_size())
 
 
 class Partition(torch.utils.data.Dataset):
@@ -88,7 +96,7 @@ def current_device(backend, local_rank):
     return torch.device("cpu")
 
 
-def partition_dataset(rank, world_size, batch_size):
+def partition_dataset(rank, world_size, batch_size, uneven_inputs=False):
     """下载一次 MNIST，再把样本均分给每个 rank，并保持全局 batch size 不变。"""
     transform = transforms.Compose(
         [transforms.ToTensor(), transforms.Normalize((0.1307,), (0.3081,))]
@@ -99,7 +107,13 @@ def partition_dataset(rank, world_size, batch_size):
     dist.barrier()
     dataset = datasets.MNIST("./data", train=True, download=False, transform=transform)
 
-    partitions = DataPartitioner(dataset, [1.0 / world_size] * world_size)
+    partition_sizes = [1.0 / world_size] * world_size
+    if uneven_inputs and world_size > 1:
+        # Give the last rank more batches so that DDP.join() has work to do.
+        delta = min(0.1, partition_sizes[0] / 2)
+        partition_sizes[0] -= delta
+        partition_sizes[-1] += delta
+    partitions = DataPartitioner(dataset, partition_sizes)
     local_batch_size = max(1, batch_size // world_size)
     loader = torch.utils.data.DataLoader(
         partitions.use(rank), batch_size=local_batch_size, shuffle=True
@@ -199,11 +213,17 @@ def ring_allreduce(send, recv, dim=-1):
 
 
 
-def train(rank, world_size, backend, implementation, epochs, batch_size):
+def train(
+    rank, world_size, backend, implementation, epochs, batch_size, uneven_inputs,
+    use_join, join_divide_by_initial_world_size, join_throw_on_early_termination,
+    gradient_accumulation_steps, comm_hook,
+):
     """每个 rank 在自己的数据分区上训练，并通过手工 all_reduce 或 DDP 同步梯度。"""
     device = current_device(backend, rank)
     torch.manual_seed(1234)  # 所有 rank 从相同初始参数开始。
-    train_loader, local_batch_size = partition_dataset(rank, world_size, batch_size)
+    train_loader, local_batch_size = partition_dataset(
+        rank, world_size, batch_size, uneven_inputs=uneven_inputs
+    )
 
     model = Net().to(device)
     if implementation == "ddp":
@@ -212,6 +232,8 @@ def train(rank, world_size, backend, implementation, epochs, batch_size):
             model,
             device_ids=[rank] if device.type == "cuda" else None,
         )
+        if comm_hook == "average-allreduce":
+            model.register_comm_hook(state=None, hook=average_allreduce_hook)
 
     optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.5)
     batches_per_epoch = ceil(len(train_loader.dataset) / float(local_batch_size))
@@ -219,15 +241,34 @@ def train(rank, world_size, backend, implementation, epochs, batch_size):
     for epoch in range(epochs):
         model.train()
         total_loss = 0.0
-        for data, target in train_loader:
-            data, target = data.to(device), target.to(device)
-            optimizer.zero_grad()
-            loss = F.nll_loss(model(data), target)
-            total_loss += loss.item()
-            loss.backward()
-            if implementation == "manual":
-                average_gradients(model)
-            optimizer.step()
+        optimizer.zero_grad()
+        join_context = (
+            model.join(
+                divide_by_initial_world_size=join_divide_by_initial_world_size,
+                throw_on_early_termination=join_throw_on_early_termination,
+            ) if implementation == "ddp" and use_join else nullcontext()
+        )
+        with join_context:
+            for step, (data, target) in enumerate(train_loader):
+                data, target = data.to(device), target.to(device)
+                synchronize = (
+                    (step + 1) % gradient_accumulation_steps == 0
+                    or step + 1 == len(train_loader)
+                )
+                sync_context = (
+                    model.no_sync()
+                    if implementation == "ddp" and gradient_accumulation_steps > 1 and not synchronize
+                    else nullcontext()
+                )
+                with sync_context:
+                    loss = F.nll_loss(model(data), target)
+                    total_loss += loss.item()
+                    (loss / gradient_accumulation_steps).backward()
+                if synchronize:
+                    if implementation == "manual":
+                        average_gradients(model)
+                    optimizer.step()
+                    optimizer.zero_grad()
 
         print(
             f"rank={rank}, implementation={implementation}, epoch={epoch}, "
@@ -236,12 +277,20 @@ def train(rank, world_size, backend, implementation, epochs, batch_size):
         )
 
 
-def worker(rank, world_size, backend, implementation, epochs, batch_size, master_port):
+def worker(
+    rank, world_size, backend, implementation, epochs, batch_size, master_port,
+    uneven_inputs, use_join, join_divide_by_initial_world_size,
+    join_throw_on_early_termination, gradient_accumulation_steps, comm_hook,
+):
     os.environ["MASTER_ADDR"] = "127.0.0.1"
     os.environ["MASTER_PORT"] = str(master_port)
     dist.init_process_group(backend=backend, rank=rank, world_size=world_size)
     try:
-        train(rank, world_size, backend, implementation, epochs, batch_size)
+        train(
+            rank, world_size, backend, implementation, epochs, batch_size,
+            uneven_inputs, use_join, join_divide_by_initial_world_size,
+            join_throw_on_early_termination, gradient_accumulation_steps, comm_hook,
+        )
         dist.barrier()
     finally:
         dist.destroy_process_group()
@@ -255,7 +304,38 @@ if __name__ == "__main__":
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument("--master-port", type=int, default=29501)
+    parser.add_argument(
+        "--uneven-inputs", action="store_true",
+        help="使各 rank 的数据量不均匀，用于演示 DDP.join()。",
+    )
+    parser.add_argument(
+        "--use-join", action="store_true",
+        help="使用 model.join() 包裹 DDP 训练循环。",
+    )
+    parser.add_argument(
+        "--join-divide-by-effective-world-size", action="store_true",
+        help="让 join() 按仍在训练的 rank 数平均梯度，而非初始 world size。",
+    )
+    parser.add_argument(
+        "--join-throw-on-early-termination", action="store_true",
+        help="任一 rank 耗尽输入时，让所有 rank 抛出异常。",
+    )
+    parser.add_argument(
+        "--gradient-accumulation-steps", type=int, default=1,
+        help="使用 DDP.no_sync() 累积的 micro-batch 数量。",
+    )
+    parser.add_argument(
+        "--comm-hook", choices=("none", "average-allreduce"), default="none",
+        help="要注册的 DDP 梯度通信钩子。",
+    )
     args = parser.parse_args()
+
+    if args.gradient_accumulation_steps < 1:
+        raise ValueError("--gradient-accumulation-steps must be at least 1")
+    if args.use_join and args.implementation != "ddp":
+        raise ValueError("--use-join requires --implementation ddp")
+    if args.comm_hook != "none" and args.implementation != "ddp":
+        raise ValueError("--comm-hook requires --implementation ddp")
 
     if args.backend == "nccl" and args.world_size > torch.cuda.device_count():
         raise ValueError("NCCL 的 world_size 不能超过可用 GPU 数量。")
@@ -268,6 +348,12 @@ if __name__ == "__main__":
             args.epochs,
             args.batch_size,
             args.master_port,
+            args.uneven_inputs,
+            args.use_join,
+            not args.join_divide_by_effective_world_size,
+            args.join_throw_on_early_termination,
+            args.gradient_accumulation_steps,
+            args.comm_hook,
         ),
         nprocs=args.world_size,
         join=True,
