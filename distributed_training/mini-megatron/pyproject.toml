@@ -1,0 +1,46 @@
+[project]
+name = "mini-megatron"
+version = "0.1.0"
+description = "Skeleton workbook for learning Megatron Bridge and Megatron-LM training"
+readme = "README.md"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[project.scripts]
+mini-qwen36 = "mini_megatron.cli:main"
+
+[project.optional-dependencies]
+train = [
+    "torch>=2.12.0",
+]
+
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[dependency-groups]
+dev = [
+    "mypy>=2.1.0",
+    "pytest>=9.0.3",
+    "ruff>=0.15.15",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+
+[tool.ruff]
+line-length = 119
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+packages = ["mini_megatron"]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["mini_megatron*"]
