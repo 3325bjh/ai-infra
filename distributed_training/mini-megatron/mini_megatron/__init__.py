@@ -18,20 +18,30 @@ from mini_megatron.config import (
     ConfigContainer,
     DataConfig,
     DistributedConfig,
+    ParallelConfig,
     Qwen36ModelConfig,
     TrainConfig,
 )
 from mini_megatron.recipes import load_recipe, qwen36_35b_a3b_debug_config, qwen36_35b_a3b_tiny_config
 from mini_megatron.training_core import TrainingSetup, TrainStepResult
+from mini_megatron.parallel import (
+    ParallelTopology,
+    ParallelProcessGroups,
+    validate_shared_pipeline_groups,
+)
 
 __all__ = [
     "ConfigContainer",
     "DataConfig",
     "DistributedConfig",
+    "ParallelConfig",
     "Qwen36ModelConfig",
     "TrainingSetup",
     "TrainStepResult",
     "TrainConfig",
+    "ParallelTopology",
+    "ParallelProcessGroups",
+    "validate_shared_pipeline_groups",
     "load_recipe",
     "qwen36_35b_a3b_debug_config",
     "qwen36_35b_a3b_tiny_config",

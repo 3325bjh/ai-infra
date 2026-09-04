@@ -162,6 +162,45 @@ class DistributedConfig:
 
 
 @dataclass(kw_only=True)
+class ParallelConfig:
+    """模型并行各个维度的大小。
+
+    TP、PP、CP、EP 的乘积必须能够整除分布式 world size，数据并行大小由剩余
+    rank 数自动推导。
+    """
+
+    tensor_model_parallel_size: int = 1
+    pipeline_model_parallel_size: int = 1
+    context_parallel_size: int = 1
+    expert_model_parallel_size: int = 1
+    expert_tensor_parallel_size: int | None = None
+    sequence_parallel: bool = False
+
+    def validate(self) -> None:
+        """在创建进程组前校验各个并行维度的大小。"""
+        dimensions = {
+            "tensor_model_parallel_size": self.tensor_model_parallel_size,
+            "pipeline_model_parallel_size": self.pipeline_model_parallel_size,
+            "context_parallel_size": self.context_parallel_size,
+            "expert_model_parallel_size": self.expert_model_parallel_size,
+        }
+        for name, size in dimensions.items():
+            if size <= 0:
+                raise ValueError(f"{name} must be positive")
+
+        if (
+            self.expert_tensor_parallel_size is not None
+            and self.expert_tensor_parallel_size <= 0
+        ):
+            raise ValueError("expert_tensor_parallel_size must be positive when set")
+
+        if self.sequence_parallel and self.tensor_model_parallel_size == 1:
+            raise ValueError(
+                "sequence_parallel requires tensor_model_parallel_size > 1"
+            )
+
+
+@dataclass(kw_only=True)
 class ConfigContainer:
     """Top-level mini training configuration skeleton."""
 
@@ -169,6 +208,7 @@ class ConfigContainer:
     train: TrainConfig
     data: DataConfig
     distributed: DistributedConfig = field(default_factory=DistributedConfig)
+    parallel: ParallelConfig = field(default_factory=ParallelConfig)
 
     def __post_init__(self) -> None:
         """Validate cross-section constraints after construction."""
@@ -178,6 +218,7 @@ class ConfigContainer:
         self.model.validate()
         self.train.validate()
         self.data.validate()
+        self.parallel.validate()
         if self.model.vocab_size!=self.data.vocab_size:
             raise ValueError("model.vocab_size must equal data.vocab_size")
         if self.model.max_position_embeddings!=self.data.seq_length:
